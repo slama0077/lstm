@@ -450,11 +450,11 @@ class bmi_LSTM(BmiBase):
                     f"expected output of length 1, got {len(output.value)}"
                 )
                 outputs[output.name].append(output.value[0])
-
+        breakpoint()
         # ensemble output and set output variables
         for name, values in outputs.items():
             self._outputs.set_value(name, np.mean(values, dtype="float64"))
-
+        breakpoint()
         # increment model timestep
         self._timestep += 1
 

@@ -11,7 +11,7 @@ import lstm.bmi_lstm as bmi_lstm
 USE_PATH = True  # (SDP; also set in bmi_lstm.py.)
 # run_dir = './extern/lstm_py/'  # (SDP)
 run_dir = './'
-cfg_file  = run_dir + 'bmi_config_files/01022500_hourly_slope_mean_precip_temp.yml'
+cfg_file  = run_dir + 'bmi_config_files/02064000_nh_NLDAS_hourly.yml'
 data_file = run_dir + 'data/usgs-streamflow-nldas_hourly.nc'
     
 def execute():
@@ -24,22 +24,22 @@ def execute():
     # Argument to initialize should be type string, not Path object. (SDP)
     # Better to use path inside initialize(). (SDP)
     ### model.initialize(bmi_cfg_file=Path('./bmi_config_files/01022500_A.yml'))
-    model.initialize(bmi_cfg_file=cfg_file)  # (SDP)
+    model.initialize(config_file=cfg_file)  # (SDP)
 
     # Get input data that matches the LSTM test runs
     print('Get input data that matches the LSTM test runs...')
 
     if (USE_PATH):
-        sample_data = Dataset(Path( data_file ), 'r')
+        sample_data = Dataset(Path(data_file), 'r')
     else:
-        sample_data = Dataset( data_file, 'r' )  # SDP
+        sample_data = Dataset(data_file, 'r')  # SDP
 
         
     # Now loop through the inputs, set the forcing values, and update the model
     print('Loop through the inputs, set the forcing values, and update the model...')
-    precip_data = sample_data['total_precipitation'][3].data
+    precip_data = sample_data['total_precipitation'][0].data
     n_forcings = precip_data.size
-    temp_data = sample_data['temperature'][3].data
+    temp_data = sample_data['temperature'][0].data
 
     for k in range(n_forcings):
     #for precip, temp in list(),
@@ -51,10 +51,10 @@ def execute():
         print('  temperature and precipitation are set to {:.2f} and {:.2f}'.format(temp, precip))
         #print('  temperature and precipitation are set to {:.2f} and {:.2f}'.format(model.temperature, model.precip))
         model.update()
-        print('  streamflow (CMS) at time {} is {:.2f}'.format(model.t, model.streamflow_cms))
+        print('  streamflow (CMS) at time {} is {}'.format(model._timestep, model._outputs))
         #### print('  streamflow (CFS) at time {} is {:.2f}'.format(model.t, model.streamflow_cfs))
 
-        if model.t > 100:
+        if model._timestep > 100:
             print('Stopping the loop...')
             break
 

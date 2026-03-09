@@ -68,6 +68,7 @@ from . import nextgen_cuda_lstm
 from .base import BmiBase
 from .logger import configure_logging, logger
 from .model_state import State, StateFacade, Var
+import time
 
 # --------------   Dynamic Attributes -----------------------------
 _dynamic_input_vars = [
@@ -139,7 +140,7 @@ class EnsembleMember:
     inference using the trained model.
     """
 
-    def __init__(self, cfg: dict[str, typing.Any], output_scaling_factor_cms: float):
+    def __init__(self, cfg: dict[str, typing.Any], output_scaling_factor_cms: float, member_config_file):
         self.cfg = cfg
         # NOTE: aaraney: not sure if this *should* go here. leaving it for now.
         self.output_scaling_factor_cms = output_scaling_factor_cms
@@ -164,9 +165,17 @@ class EnsembleMember:
         hidden_layer_size = cfg["hidden_size"]
         # if init_config['initial_state'] == 'zero':
         # NOTE: aaraney: assume initial state is always zero (ask jframe about this. no other option now)
-        self.h_t = torch.zeros(1, batch_size, hidden_layer_size).float()
-        self.c_t = torch.zeros(1, batch_size, hidden_layer_size).float()
 
+        self.lstm_internal_state_path = member_config_file.parent / "lstm_state.pt"
+        if (self.lstm_internal_state_path.exists()):
+            initial_state = torch.load("trained_neuralhydrology_models/nh_AORC_hourly_slope_elev_precip_temp_seq999_seed101_2801_191806/lstm_state.pt")
+            self.h_t = initial_state["h"]
+            self.c_t = initial_state["c"]
+        else:
+            self.h_t = torch.zeros(1, batch_size, hidden_layer_size).float()
+            self.c_t = torch.zeros(1, batch_size, hidden_layer_size).float()
+        
+    
     def update(self, state: Valuer) -> typing.Iterable[Var]:
         """
         Run a single model timestep and return the model inference values.
@@ -184,6 +193,15 @@ class EnsembleMember:
             lstm_output, self.h_t, self.c_t = self.lstm.forward(
                 input_tensor, self.h_t, self.c_t
             )
+            #remove the previous lstm state and save the new one
+            self.lstm_internal_state_path.unlink()
+            time.sleep(5)
+            print("Saving new lstm state")
+            torch.save({
+                "h": self.h_t,
+                "c": self.c_t
+            }, self.lstm_internal_state_path)
+
             # TODO: aaraney, there is gap here between mapping 'internal'
             # output names to 'external' output names. Right now this is
             # hard-coded and handled in `scale_outputs`. Introduce semantics
@@ -195,6 +213,7 @@ class EnsembleMember:
                 self.scalars.output_std,
                 self.output_scaling_factor_cms,
             )
+        
 
 
 def bmi_array(arr: list[float]) -> npt.NDArray:
@@ -427,7 +446,7 @@ class bmi_LSTM(BmiBase):
         for member_cfg_file in self.cfg_bmi["train_cfg_file"]:
             cfg = yaml.load(member_cfg_file.read_text(), Loader=SafeLoader)
             coerce_config(cfg)
-            member = EnsembleMember(cfg, output_factor_cms)
+            member = EnsembleMember(cfg, output_factor_cms, member_cfg_file)
             self.ensemble_members.append(member)
 
         # load static variables from config into state
@@ -450,11 +469,9 @@ class bmi_LSTM(BmiBase):
                     f"expected output of length 1, got {len(output.value)}"
                 )
                 outputs[output.name].append(output.value[0])
-        breakpoint()
         # ensemble output and set output variables
         for name, values in outputs.items():
             self._outputs.set_value(name, np.mean(values, dtype="float64"))
-        breakpoint()
         # increment model timestep
         self._timestep += 1
 

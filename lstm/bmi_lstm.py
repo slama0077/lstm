@@ -52,6 +52,8 @@ from __future__ import annotations
 import collections
 import typing
 from dataclasses import dataclass
+import io
+import sqlite3
 from pathlib import Path
 
 import numpy as np
@@ -68,7 +70,6 @@ from . import nextgen_cuda_lstm
 from .base import BmiBase
 from .logger import configure_logging, logger
 from .model_state import State, StateFacade, Var
-import time
 
 # --------------   Dynamic Attributes -----------------------------
 _dynamic_input_vars = [
@@ -140,14 +141,21 @@ class EnsembleMember:
     inference using the trained model.
     """
 
-    def __init__(self, cfg: dict[str, typing.Any], output_scaling_factor_cms: float, member_config_file):
+    def __init__(
+        self,
+        cfg: dict[str, typing.Any],
+        output_scaling_factor_cms: float,
+        member_config_file: Path,
+        catchment_id: int,
+        state_store: "LstmStateStore",
+    ):
         self.cfg = cfg
         # NOTE: aaraney: not sure if this *should* go here. leaving it for now.
         self.output_scaling_factor_cms = output_scaling_factor_cms
 
         # load training feature scales
         scaler_file = cfg["run_dir"] / "train_data/train_data_scaler.yml"
-        with scaler_file.open("r") as fp:
+        with scaler_file.open("r") as fp: 
             train_data_scaler = yaml.load(fp, Loader=SafeLoader)
         self.scalars = load_training_scalars(cfg, train_data_scaler)
 
@@ -166,11 +174,14 @@ class EnsembleMember:
         # if init_config['initial_state'] == 'zero':
         # NOTE: aaraney: assume initial state is always zero (ask jframe about this. no other option now)
 
-        self.lstm_internal_state_path = member_config_file.parent / "lstm_state.pt"
-        if (self.lstm_internal_state_path.exists()):
-            initial_state = torch.load("trained_neuralhydrology_models/nh_AORC_hourly_slope_elev_precip_temp_seq999_seed101_2801_191806/lstm_state.pt")
-            self.h_t = initial_state["h"]
-            self.c_t = initial_state["c"]
+        self.name = member_config_file.parent
+        self.basin_id = str(catchment_id)
+        self.member_id = str(self.name)
+        self.state_store = state_store
+
+        loaded = self.state_store.load(self.basin_id, self.member_id)
+        if loaded is not None:
+            self.h_t, self.c_t = loaded
         else:
             self.h_t = torch.zeros(1, batch_size, hidden_layer_size).float()
             self.c_t = torch.zeros(1, batch_size, hidden_layer_size).float()
@@ -193,14 +204,7 @@ class EnsembleMember:
             lstm_output, self.h_t, self.c_t = self.lstm.forward(
                 input_tensor, self.h_t, self.c_t
             )
-            #remove the previous lstm state and save the new one
-            self.lstm_internal_state_path.unlink()
-            time.sleep(5)
-            print("Saving new lstm state")
-            torch.save({
-                "h": self.h_t,
-                "c": self.c_t
-            }, self.lstm_internal_state_path)
+            self.state_store.save(self.basin_id, self.member_id, self.h_t, self.c_t)
 
             # TODO: aaraney, there is gap here between mapping 'internal'
             # output names to 'external' output names. Right now this is
@@ -233,6 +237,77 @@ class TrainingScalars:
     input_std: npt.NDArray
     output_mean: npt.NDArray
     output_std: npt.NDArray
+
+
+def _serialize_tensor(tensor: torch.Tensor) -> bytes:
+    buffer = io.BytesIO()
+    torch.save(tensor.detach().cpu(), buffer)
+    return buffer.getvalue()
+
+
+def _deserialize_tensor(blob: bytes) -> torch.Tensor:
+    buffer = io.BytesIO(blob)
+    return torch.load(buffer, map_location=torch.device("cpu"))
+
+
+class LstmStateStore:
+    def __init__(self, db_path: Path) -> None:
+        self.db_path = db_path
+        self._conn = sqlite3.connect(self.db_path)
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS lstm_state (
+                basin_id TEXT NOT NULL,
+                ensemble_member TEXT NOT NULL,
+                h_t BLOB NOT NULL,
+                c_t BLOB NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (basin_id, ensemble_member)
+            )
+            """
+        )
+        self._conn.commit()
+
+    def load(
+        self, basin_id: str, ensemble_member: str
+    ) -> typing.Optional[tuple[torch.Tensor, torch.Tensor]]:
+        row = self._conn.execute(
+            """
+            SELECT h_t, c_t
+            FROM lstm_state
+            WHERE basin_id = ? AND ensemble_member = ?
+            """,
+            (basin_id, ensemble_member),
+        ).fetchone()
+        if row is None:
+            return None
+        h_t = _deserialize_tensor(row[0])
+        c_t = _deserialize_tensor(row[1])
+        return h_t, c_t
+
+    def save(
+        self,
+        basin_id: str,
+        ensemble_member: str,
+        h_t: torch.Tensor,
+        c_t: torch.Tensor,
+    ) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO lstm_state (basin_id, ensemble_member, h_t, c_t, updated_at)
+            VALUES (?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(basin_id, ensemble_member)
+            DO UPDATE SET
+                h_t = excluded.h_t,
+                c_t = excluded.c_t,
+                updated_at = excluded.updated_at
+            """,
+            (basin_id, ensemble_member, _serialize_tensor(h_t), _serialize_tensor(c_t)),
+        )
+        self._conn.commit()
+
+    def close(self) -> None:
+        self._conn.close()
 
 
 def load_training_scalars(
@@ -423,6 +498,7 @@ class bmi_LSTM(BmiBase):
         # here, however the names are bound and initialized in `initialize`.
         self.cfg_bmi: dict[str, typing.Any]
         self.ensemble_members: list[EnsembleMember]
+        self._state_store: LstmStateStore
 
     def initialize(self, config_file: str) -> None:
         # read and setup main configuration file
@@ -443,10 +519,20 @@ class bmi_LSTM(BmiBase):
 
         # initialize ensemble members
         self.ensemble_members = []
+        db_dir = Path("trained_neuralhydrology_models")
+        db_dir.mkdir(parents=True, exist_ok=True)
+        db_path = db_dir / "lstm_state.sqlite"
+        self._state_store = LstmStateStore(db_path)
         for member_cfg_file in self.cfg_bmi["train_cfg_file"]:
             cfg = yaml.load(member_cfg_file.read_text(), Loader=SafeLoader)
             coerce_config(cfg)
-            member = EnsembleMember(cfg, output_factor_cms, member_cfg_file)
+            member = EnsembleMember(
+                cfg,
+                output_factor_cms,
+                member_cfg_file,
+                self.cfg_bmi["basin_id"],
+                self._state_store,
+            )
             self.ensemble_members.append(member)
 
         # load static variables from config into state
@@ -493,7 +579,9 @@ class bmi_LSTM(BmiBase):
         for _ in range(int(n_steps)):
             self.update()
 
-    def finalize(self) -> None: ...
+    def finalize(self) -> None:
+        if hasattr(self, "_state_store"):
+            self._state_store.close()
 
     def get_component_name(self) -> str:
         return "LSTM"

@@ -40,7 +40,6 @@ def execute():
     precip_data = sample_data['total_precipitation'][0].data
     n_forcings = precip_data.size
     temp_data = sample_data['temperature'][0].data
-
     for k in range(n_forcings):
     #for precip, temp in list(),
         

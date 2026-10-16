@@ -50,6 +50,7 @@
 from __future__ import annotations
 
 import collections
+import os
 import typing
 from dataclasses import dataclass
 import io
@@ -204,7 +205,9 @@ class EnsembleMember:
             lstm_output, self.h_t, self.c_t = self.lstm.forward(
                 input_tensor, self.h_t, self.c_t
             )
-            self.state_store.save(self.basin_id, self.member_id, self.h_t, self.c_t)
+
+            # Keep the latest hidden/cell states in memory. They are persisted
+            # once in bmi_LSTM.finalize().
 
             # TODO: aaraney, there is gap here between mapping 'internal'
             # output names to 'external' output names. Right now this is
@@ -251,10 +254,105 @@ def _deserialize_tensor(blob: bytes) -> torch.Tensor:
 
 
 class LstmStateStore:
-    def __init__(self, db_path: Path) -> None:
-        self.db_path = db_path
-        self._conn = sqlite3.connect(self.db_path)
-        self._conn.execute(
+    """
+    Store LSTM hidden/cell states using process-local SQLite databases.
+
+    Warm states from the previous successful simulation are read from all
+    SQLite databases in::
+
+        <state_dir>/current/
+
+    Updated warm states are written to a process-specific SQLite database in::
+
+        <state_dir>/next/lstm_state_<pid>.sqlite
+
+    This allows multiple NextGen processes to write states in parallel without
+    contending for the same SQLite database.
+
+    States loaded from ``current`` are cached once per Python process so that
+    every bmi_LSTM instance in the same process does not repeatedly read all
+    state databases.
+    """
+
+    # Each MPI process has its own Python interpreter, so this cache is local
+    # to that process. All bmi_LSTM instances within the process share it.
+    _cached_current_dir: typing.Optional[Path] = None
+    _cached_states: dict[tuple[str, str], tuple[bytes, bytes]] = {}
+
+    def __init__(self, state_dir: Path) -> None:
+        self.state_dir = state_dir
+        self.current_dir = state_dir / "current"
+        self.next_dir = state_dir / "next"
+
+        # Safe for multiple processes: mkdir(..., exist_ok=True) succeeds if
+        # another process has already created these directories.
+        self.current_dir.mkdir(parents=True, exist_ok=True)
+        self.next_dir.mkdir(parents=True, exist_ok=True)
+
+        # Every OS process writes to its own SQLite database.
+        #
+        # Multiple bmi_LSTM instances within the same process intentionally
+        # share this database.
+        self.db_path = self.next_dir / f"lstm_state_{os.getpid()}.sqlite"
+
+        # Loading every current database once per bmi_LSTM instance would be
+        # unnecessarily expensive. Cache them once per Python process instead.
+        if LstmStateStore._cached_current_dir != self.current_dir:
+            LstmStateStore._cached_states = self._load_current_states()
+            LstmStateStore._cached_current_dir = self.current_dir
+
+    def _load_current_states(
+        self,
+    ) -> dict[tuple[str, str], tuple[bytes, bytes]]:
+        """
+        Load all persisted warm states from SQLite files in ``current``.
+
+        The serialized tensor blobs are kept in memory and are deserialized
+        only when a specific basin/member requests its state.
+        """
+        states: dict[tuple[str, str], tuple[bytes, bytes]] = {}
+
+        db_files = sorted(self.current_dir.glob("*.sqlite"))
+
+        for db_path in db_files:
+            # These databases belong to the previous completed simulation and
+            # are read-only for the duration of this run.
+            with sqlite3.connect(db_path) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT basin_id, ensemble_member, h_t, c_t
+                    FROM lstm_state
+                    """
+                ).fetchall()
+
+            for basin_id, ensemble_member, h_t, c_t in rows:
+                key = (basin_id, ensemble_member)
+
+                if key in states:
+                    logger.warning(
+                        "Duplicate LSTM warm state for basin=%s, "
+                        "ensemble_member=%s while reading %s; "
+                        "using the last value found.",
+                        basin_id,
+                        ensemble_member,
+                        db_path,
+                    )
+
+                states[key] = (h_t, c_t)
+
+        logger.info(
+            "Loaded %d LSTM warm states from %d SQLite file(s) in %s",
+            len(states),
+            len(db_files),
+            self.current_dir,
+        )
+
+        return states
+
+    @staticmethod
+    def _create_table(conn: sqlite3.Connection) -> None:
+        """Create the LSTM state table if it does not already exist."""
+        conn.execute(
             """
             CREATE TABLE IF NOT EXISTS lstm_state (
                 basin_id TEXT NOT NULL,
@@ -266,23 +364,25 @@ class LstmStateStore:
             )
             """
         )
-        self._conn.commit()
 
     def load(
         self, basin_id: str, ensemble_member: str
     ) -> typing.Optional[tuple[torch.Tensor, torch.Tensor]]:
-        row = self._conn.execute(
-            """
-            SELECT h_t, c_t
-            FROM lstm_state
-            WHERE basin_id = ? AND ensemble_member = ?
-            """,
-            (basin_id, ensemble_member),
-        ).fetchone()
+        """
+        Return the warm state loaded from ``current`` for a basin/member.
+
+        Returns ``None`` when no previous warm state exists.
+        """
+        row = LstmStateStore._cached_states.get(
+            (basin_id, ensemble_member)
+        )
+
         if row is None:
             return None
+
         h_t = _deserialize_tensor(row[0])
         c_t = _deserialize_tensor(row[1])
+
         return h_t, c_t
 
     def save(
@@ -292,22 +392,49 @@ class LstmStateStore:
         h_t: torch.Tensor,
         c_t: torch.Tensor,
     ) -> None:
-        self._conn.execute(
-            """
-            INSERT INTO lstm_state (basin_id, ensemble_member, h_t, c_t, updated_at)
-            VALUES (?, ?, ?, ?, datetime('now'))
-            ON CONFLICT(basin_id, ensemble_member)
-            DO UPDATE SET
-                h_t = excluded.h_t,
-                c_t = excluded.c_t,
-                updated_at = excluded.updated_at
-            """,
-            (basin_id, ensemble_member, _serialize_tensor(h_t), _serialize_tensor(c_t)),
-        )
-        self._conn.commit()
+        """
+        Save the final warm state to this process's database in ``next``.
+
+        SQLite connections are intentionally short-lived. No connection is
+        kept open during model execution.
+        """
+        with sqlite3.connect(self.db_path, timeout=60.0) as conn:
+            self._create_table(conn)
+
+            conn.execute(
+                """
+                INSERT INTO lstm_state (
+                    basin_id,
+                    ensemble_member,
+                    h_t,
+                    c_t,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, datetime('now'))
+                ON CONFLICT(basin_id, ensemble_member)
+                DO UPDATE SET
+                    h_t = excluded.h_t,
+                    c_t = excluded.c_t,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    basin_id,
+                    ensemble_member,
+                    _serialize_tensor(h_t),
+                    _serialize_tensor(c_t),
+                ),
+            )
+
+            # The connection context manager commits on successful exit.
 
     def close(self) -> None:
-        self._conn.close()
+        """
+        Retained for compatibility with bmi_LSTM.finalize().
+
+        Connections are opened only while reading or writing and are closed
+        immediately afterward, so there is no persistent connection to close.
+        """
+        pass
 
 
 def load_training_scalars(
@@ -519,10 +646,18 @@ class bmi_LSTM(BmiBase):
 
         # initialize ensemble members
         self.ensemble_members = []
-        db_dir = Path("trained_neuralhydrology_models")
-        db_dir.mkdir(parents=True, exist_ok=True)
-        db_path = db_dir / "lstm_state.sqlite"
-        self._state_store = LstmStateStore(db_path)
+        # db_dir = Path("trained_neuralhydrology_models")
+        #NGIAB test
+
+        # Warm-state storage.
+        # Previous states are read from:
+        #   /ngen/ngen/data/lstm_states/current/
+        #
+        # Updated states are written independently by each process to:
+        #   /ngen/ngen/data/lstm_states/next/
+        state_dir = Path("/ngen/ngen/data/lstm_states")
+        self._state_store = LstmStateStore(state_dir)
+
         for member_cfg_file in self.cfg_bmi["train_cfg_file"]:
             cfg = yaml.load(member_cfg_file.read_text(), Loader=SafeLoader)
             coerce_config(cfg)
@@ -581,6 +716,15 @@ class bmi_LSTM(BmiBase):
 
     def finalize(self) -> None:
         if hasattr(self, "_state_store"):
+            # Persist only the final hidden/cell state for each ensemble member.
+            for member in self.ensemble_members:
+                self._state_store.save(
+                    member.basin_id,
+                    member.member_id,
+                    member.h_t,
+                    member.c_t,
+                )
+
             self._state_store.close()
 
     def get_component_name(self) -> str:
